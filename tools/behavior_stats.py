@@ -105,6 +105,9 @@ for seed in range(start, start + count):
                     totals[target_kind][f"damage_taken_from_{kind}"] += strike.damage
             if activation.killed_id is not None:
                 alive.discard(activation.killed_id)
+                # S5 task 10: one of ours died before its next activation, i.e. on the tile it chose.
+                if activation.killed_id.split("_")[0] == own:
+                    totals[activation.killed_id.split("_")[1]]["died"] += 1
             if side != own:
                 continue
 
@@ -190,5 +193,10 @@ report = {
         f["damage_taken_from_archer"] + c["damage_taken_from_archer"], games
     ),
     "activations_per_unit": {k: mean(lists[f"activations_per_{k}"]) for k in ("footman", "archer", "cavalry")},
+    # S5 task 10: deaths per activation = how often a chosen tile was the last one.
+    "died_per_activation": {
+        k: ratio(totals[k]["died"], totals[k]["activations"]) for k in ("footman", "archer", "cavalry")
+    },
+    "deaths_per_game": {k: ratio(totals[k]["died"], games) for k in ("footman", "archer", "cavalry")},
 }
 print(json.dumps(report))

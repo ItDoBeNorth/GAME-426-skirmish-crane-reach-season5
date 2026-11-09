@@ -19,7 +19,7 @@ from encoder import (
 )
 from enemy_memory import EnemyMemory
 from imitation_model import load_policy
-from sandbox.crane import me, tile, visible
+from sandbox.crane import me, tile, units, visible
 
 # S5 task 9 (hybrid rule part): remember enemies out of sight and show them to the model. The
 # model must be trained with the same setting, so this follows the encoder's switch (off: the memory
@@ -44,6 +44,21 @@ FOOTMEN_ANSWER_ARCHERS = True
 # idle archers "stay" twice as often when learners play (15% vs 7.5%), because the teacher keeps
 # archers behind its footmen and the learner's footmen are more passive. Not installed.
 ARCHER_RANGE = 6
+# S5 task 10, safety veto: if the chosen tile would likely kill us before our next activation and
+# some reachable tile would not, take the network's best-scoring survivable tile instead. The
+# estimate is rough (straight-line reach, base damage, +2 for a cavalry charge, -1 arrow damage in
+# forest), so it only vetoes clearly lethal tiles. Measured first: the t10 learner dies less per
+# activation than the teacher (vs Banner: archers 1.4% vs 2.4%, footmen 3.7% vs 4.1%, cavalry 22.6%
+# vs 23.5%), so there is no learner-specific gap to close.
+# Off: seeds 600-619 wins/40 (mean) with the veto: Banner 40 (97.8), teacher 21 (52.3), Banner
+# learner 39 (94.9), and 7/40 (18.5) head-to-head against the same learner without it. It cut cavalry
+# deaths from ~23% to ~9% per activation, but, as with the teacher's CAVALRY_* switches, cavalry
+# aggression is worth its cost.
+SAFETY_VETO = False
+# S5 task 12, model size (same t10 data): width/layers 32/1 (21.7k parameters, 105 KB, 54.0% tile
+# agreement), 64/2 (113.7k, 474 KB, 53.4%, installed) and 128/3 (572.8k, 2.3 MB, 52.4%, best epoch 9:
+# memorises fastest). Head-to-head against the installed 64/2 learner: 32/1 14/40 (35.7), 128/3
+# 15/40 (38.5), so 64/2 stays.
 
 
 def option_tensor(rows):
@@ -84,6 +99,24 @@ def choose_action(model, observation, remembered=(), override=None):
     return {"path": path, "target": targets[int(scores[0].argmax())]}
 
 
+def incoming_estimate(observation, end):
+    """S5 task 10: rough damage the visible enemies could deal to `end` before our next activation."""
+    in_forest = tile.terrain_at(observation, end)["feature"] == "forest"
+    total = 0
+    for enemy in visible.enemies(observation):
+        stats = units.STATS[enemy["type"]]
+        gap = tile.distance(end, enemy["position"])
+        if gap > stats.movement_points + stats.attack_range:
+            continue
+        damage = stats.damage
+        if enemy["type"] == "cavalry" and gap >= 4:
+            damage += 2  # room to walk 3+ tiles first: a charge
+        if enemy["type"] == "archer" and in_forest:
+            damage -= 1
+        total += damage
+    return total
+
+
 class Agent:
     def __init__(self):
         # A model this small runs fastest on one CPU thread. The setting applies to the whole
@@ -110,7 +143,19 @@ class Agent:
         return action
 
     def override(self, observation, moves, scores, chosen):
-        """S5 learner fixes: replace some "stay" picks (see the switches at the top). None = keep."""
+        """S5 learner fixes: replace some picks (see the switches at the top). None = keep."""
+        replaced = self.replace_stay(observation, moves, scores, chosen)
+        if SAFETY_VETO:
+            index = chosen if replaced is None else replaced
+            hit_points = observation["observation"]["self"]["hit_points"]
+            if incoming_estimate(observation, moves[index][1]) >= hit_points:
+                safe = [i for i, (_, end) in enumerate(moves) if incoming_estimate(observation, end) < hit_points]
+                if safe:
+                    return max(safe, key=lambda i: scores[i])
+        return replaced
+
+    def replace_stay(self, observation, moves, scores, chosen):
+        """S5 learner fixes 1-2: replace some "stay" picks. None = keep."""
         here = me.position(observation)
         if moves[chosen][1] != here:
             return None
