@@ -136,3 +136,14 @@ Each exercise asks one design question. You can make the change yourself or desc
 ## Submitting
 
 The learner submits like any other agent: follow the shared [submitting guide](https://vox-deorum.github.io/game-sandbox/students/submitting/). The course server provides its own copy of PyTorch, and `imitation-policy.pt` counts toward the season's size limit, so keep the model small. The server never runs the scripts in `imitation/`.
+
+
+
+
+## Reflection
+Season 5: Implemented imitation learning, using the season 4 agent as the teacher and testing against banner and naive. Added logic for additional zones, what happens when the score is low against the agent, getting more aggressive and gaining high ground when needed, and more logic learned from training on the teacher's decisions. Noticeable changes to charge and shieldwall, archer movement, zone focus, and tile cost decision-making. Tested and decided against zone squads and cavalry caution rules. Significant increase in wins. 
+
+## AI Use Disclosure and Reflection
+I used Claude Code in VS Code. It coded all of this based on my pseudocode and instructions. I verified each set of code it wrote before approving it, reverted and asked for changes as needed, tested by watching and eval, and discussed my ideas for solutions before committing to one. I did not write any code directly, but read summaries to check it. I had it set to ask for approval before committing anything, and that worked especially during testing and understanding what code was being changed. The most successful part was that we made and followed a plan based on what I wanted, and slowly went through it while changing code and testing. However, Claude has started to run more complicated commands I don't understand in order to read my older code and test. It might get too fast for me to understand whats going on most of the time. The code has gotten quite complicated as well. 
+
+
