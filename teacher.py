@@ -89,6 +89,33 @@ ZONE_URGENT_SHARE = 0.75
 # archers. With zone duty as a forecast-judge option (task 12) it also lost to task 6 (Banner 85%,
 # s4_t6 45%): the zone rarely decides a game that ends by elimination in ~30 rounds.
 USE_ZONE_LOGIC = False
+# S5 task 5, design (b) "main army + zone holders". Season 5 has three zones: the middle ford and a
+# mirrored pair near each side's back edge (a "home" zone per side). Against a learner that parks
+# one footman in its home zone, the S4 agent lost 17 of 18 capture games while holding ~10 units to
+# its ~2: it only ever held the middle zone and never went after the parked footman.
+# HOME_ZONE_HOLDER: our first footman (roster order) holds our home zone. v1 has no replacement if
+# it dies (the roster lists dead units too, so allies cannot tell).
+HOME_ZONE_HOLDER = True
+# HUNT_ENEMY_ZONE: once no enemy has been seen for HUNT_QUIET_ROUNDS while the enemy's capture score
+# rose within HUNT_SCORE_ROUNDS, idle units march on the enemy's home zone instead of wandering.
+HUNT_ENEMY_ZONE = True
+HUNT_QUIET_ROUNDS = 3
+HUNT_SCORE_ROUNDS = 2
+# S5 task 5, design (a) "mixed squads per zone": units are split into squads at reset by their
+# index within their type (red_footman_3 -> 3). The home squad holds our home zone, the flank squad
+# goes for the enemy's home zone, everyone else is the centre army (the usual S4 rules). Squad
+# members still strike, protect allies and answer alerts first; the squad zone replaces only the
+# idle formation/wandering. Footmen stand on zone tiles, archers and cavalry within SQUAD_RADIUS of
+# the zone's centre. Run with HOME_ZONE_HOLDER = False (the home squad replaces the single holder).
+# Off: it lost to design (b) on fresh seeds 600-619 (wins/40, mean score):
+#   full squads:    Banner 27 (67.8), S4 copy 15 (37.5), learner 37 (92.5), head-to-head vs (b) 22 (55.0)
+#   home squad only: Banner 34 (85.0), S4 copy 20 (50.0), learner 39 (97.5), head-to-head vs (b) 19 (47.5)
+#   design (b):     Banner 40 (97.9), S4 copy 40 (89.9), learner 38 (95.4), vs itself 20 (50.0)
+# Pulling squads out of the main army loses the fight; (b)'s holder already starts on the home zone.
+ZONE_SQUADS = False
+SQUAD_HOME = {"footman": (0, 1), "archer": (0,), "cavalry": ()}
+SQUAD_FLANK = {"footman": (2, 3), "archer": (1,), "cavalry": (0, 1, 2)}
+SQUAD_RADIUS = 2
 # Forecast judge (S4 task 12, the course's search-based planning): a footman compares candidate
 # moves (hold its slot, advance on a target, and go to the zone if FORECAST_ZONE_CANDIDATE) by
 # forecasting FORECAST_ROUNDS of its own activations and scoring
@@ -214,13 +241,41 @@ class Agent:
         # Capture zones (S4 task 8): every zone tile (Season 4 has one zone, on the middle ford),
         # the capture scores seen at our last activation, the freshest chat zone report, and this
         # activation's zone picture (see _update_zone).
+        # S5 task 4: Season 5 has three zones (the middle ford plus a mirrored pair), so each zone
+        # keeps its own center, tiles and chat report. Zone indices follow zone.zones(), which lists
+        # them in the same order for every unit on both sides.
         found = zone.zones(observation)
         self._side = own_side
-        self._zone_tiles: set[Key] = {self._key(spot) for area in found for spot in area["tiles"]}
-        self._zone_centers: list[Position] = [self._copy(area["center"]) for area in found]
+        self._zone_areas: list[dict] = [
+            {"center": self._copy(area["center"]), "tiles": {self._key(spot) for spot in area["tiles"]}}
+            for area in found
+        ]
+        self._zone_tiles: set[Key] = {key for area in self._zone_areas for key in area["tiles"]}
+        self._zone_centers: list[Position] = [area["center"] for area in self._zone_areas]
         self._capture_seen: dict[str, int] | None = None
-        self._zone_report: dict[str, int] | None = None
+        self._zone_reports: dict[int, dict[str, int]] = {}
         self._zone: dict = {}
+        # S5 task 5: our home zone (the outer zone nearest our start) and the enemy's (the outer
+        # zone farthest from it), the last round the enemy's capture score rose, and whether this
+        # unit is the home-zone holder (our first footman in roster order).
+        middle = self._key(tile.at_center(observation))
+        outer = [area for area in self._zone_areas if self._key(area["center"]) != middle]
+        start = me.position(observation)
+        self._home_zone: dict | None = None
+        self._enemy_home_zone: dict | None = None
+        if len(outer) >= 2:
+            by_distance = sorted(outer, key=lambda area: (self._distance(start, area["center"]), self._key(area["center"])))
+            self._home_zone, self._enemy_home_zone = by_distance[0], by_distance[-1]
+        self._enemy_scored_round: int | None = None
+        first_footman = next((entry["unit_id"] for entry in rosters[own_side] if entry["type"] == "footman"), None)
+        self._home_holder = first_footman == own_id
+        # S5 task 5, design (a): this unit's squad zone (None = centre army).
+        own_type, own_index = me.unit_type(observation), int(own_id.split("_")[2])
+        self._squad_zone: dict | None = None
+        if own_index in SQUAD_HOME.get(own_type, ()):
+            self._squad_zone = self._home_zone
+        elif own_index in SQUAD_FLANK.get(own_type, ()):
+            self._squad_zone = self._enemy_home_zone
         # Forecast judge (S4 task 12): time spent this game, the committed choice, and a re-entry
         # guard (the judge asks _melee_move for the "hold" move).
         self._forecast_ms = 0.0
@@ -305,8 +360,11 @@ class Agent:
         ]
         # Zone relay (S4 task 10): "Z <ours>.<theirs>", units of each side on the zone, sent only when
         # we see the whole zone, so allies out of sight know whether it needs keepers.
+        # S5 task 4: one "<zone index>.<ours>.<theirs>" entry per zone we see.
         if USE_ZONE_LOGIC and self._zone.get("sees"):
-            sections.append(("Z", [f"{self._zone['ours']}.{self._zone['theirs']}"]))
+            sections.append(
+                ("Z", [f"{area['index']}.{area['ours']}.{area['theirs']}" for area in self._zone["zones"] if area["sees"]])
+            )
         # Group relay: note our own group (us + allies in sight), then pass on the biggest group we
         # know of as "B <q>.<r>.<size>.<round>" so separate groups can find each other and merge.
         members = [here, *(ally["position"] for ally in self._allies_now)]
@@ -392,10 +450,12 @@ class Agent:
                     self._note_group({"q": q, "r": r}, size, group_round)
                     continue
                 if tag == "Z":
-                    ours, theirs = (int(part) for part in body.split(".", 1))
-                    known = self._zone_report
-                    if known is None or known["round"] <= sent_round:
-                        self._zone_report = {"ours": ours, "theirs": theirs, "round": sent_round}
+                    # S5 task 4: one "<zone index>.<ours>.<theirs>" entry per zone the sender sees.
+                    for entry in body.split():
+                        index, ours, theirs = (int(part) for part in entry.split(".", 2))
+                        known = self._zone_reports.get(index)
+                        if known is None or known["round"] <= sent_round:
+                            self._zone_reports[index] = {"ours": ours, "theirs": theirs, "round": sent_round}
                     continue
                 for entry in body.split():
                     code, q, r, hit_points = entry.split(".")
@@ -465,8 +525,14 @@ class Agent:
         else from a fresh chat "Z" report (ours stays 0 and theirs falls back to remembered enemies
         when there is none). The capture score is the one signal that needs no sight: if the enemy's
         score rose since our last activation, it held the zone uncontested at a round end.
+
+        S5 task 4: the picture is built per zone in self._zone["zones"] (index, center, tiles, ours,
+        theirs, sees, enemy_scoring); the top-level "ours"/"theirs"/"sees" sum over all zones. A
+        score rise says the enemy held *some* zone, not which one, so it marks every zone we cannot
+        see clear of enemies. With one zone this matches the Season 4 picture, except that a zone we
+        see with no enemy on it no longer counts as enemy-held after a score rise.
         """
-        if not self._zone_tiles:
+        if not self._zone_areas:
             self._zone = {}
             return
         capture = observation["observation"].get("capture") or {}
@@ -475,30 +541,45 @@ class Agent:
         last = self._capture_seen
         enemy_scored = last is not None and theirs_score > last["theirs"]
         self._capture_seen = {"ours": ours_score, "theirs": theirs_score}
+        if enemy_scored:
+            # S5 task 5: remembered for HUNT_ENEMY_ZONE.
+            self._enemy_scored_round = self._round
 
         here = self._here
+        here_key = self._key(here)
         vision = units.STATS[me.unit_type(observation)].vision + (tile.terrain_at(observation, here)["terrain"] == "hill")
-        sees = any(self._distance(here, center) + 1 <= vision for center in self._zone_centers)
-        report = self._zone_report
-        if sees:
-            ours = (self._key(here) in self._zone_tiles) + sum(
-                self._key(ally["position"]) in self._zone_tiles for ally in self._allies_now
-            )
-            theirs = sum(self._key(enemy["position"]) in self._zone_tiles for enemy in self._enemies_now)
-        elif report is not None and self._round - report["round"] <= ZONE_REPORT_ROUNDS:
-            ours, theirs = report["ours"], report["theirs"]
-        else:
-            ours = int(self._key(here) in self._zone_tiles)
-            theirs = sum(
-                self._key(record["position"]) in self._zone_tiles
-                for record in self._recent(self._enemy_memory, 1)
+        remembered = self._recent(self._enemy_memory, 1)
+        pictures = []
+        for index, area in enumerate(self._zone_areas):
+            tiles = area["tiles"]
+            sees = self._distance(here, area["center"]) + 1 <= vision
+            report = self._zone_reports.get(index)
+            if sees:
+                ours = (here_key in tiles) + sum(self._key(ally["position"]) in tiles for ally in self._allies_now)
+                theirs = sum(self._key(enemy["position"]) in tiles for enemy in self._enemies_now)
+            elif report is not None and self._round - report["round"] <= ZONE_REPORT_ROUNDS:
+                ours, theirs = report["ours"], report["theirs"]
+            else:
+                ours = int(here_key in tiles)
+                theirs = sum(self._key(record["position"]) in tiles for record in remembered)
+            pictures.append(
+                {
+                    "index": index,
+                    "center": area["center"],
+                    "tiles": tiles,
+                    "ours": ours,
+                    "theirs": theirs,
+                    "sees": sees,
+                    "enemy_scoring": (theirs > 0 and ours == 0) or (enemy_scored and not (sees and theirs == 0)),
+                }
             )
         target = int(capture.get("target", 0) or 0)
         self._zone = {
-            "ours": ours,
-            "theirs": theirs,
-            "sees": sees,
-            "enemy_scoring": enemy_scored or (theirs > 0 and ours == 0),
+            "zones": pictures,
+            "ours": sum(area["ours"] for area in pictures),
+            "theirs": sum(area["theirs"] for area in pictures),
+            "sees": any(area["sees"] for area in pictures),
+            "enemy_scoring": any(area["enemy_scoring"] for area in pictures),
             "lead": ours_score - theirs_score,
             "urgent": target > 0 and theirs_score >= target * ZONE_URGENT_SHARE,
         }
@@ -602,6 +683,15 @@ class Agent:
             )
             return self._order(best_path, name, observation)
 
+        # S5 task 5: the fight has gone quiet while the enemy keeps scoring: go to its home zone.
+        hunt_goal = self._hunt_goal(enemies) if HUNT_ENEMY_ZONE else None
+        if hunt_goal is not None:
+            return self._order(self._toward(observation, paths, hunt_goal), None, observation)
+        if ZONE_SQUADS and self._squad_zone is not None:
+            # S5 task 5, design (a): squad archers go to and stay near their squad's zone.
+            squad = self._squad_move(observation, paths, self._squad_zone)
+            if squad is not None:
+                return self._order(squad, None, observation)
         # Merge groups (no enemy in sight): join a bigger group heard about by chat.
         bigger = None if enemies else self._bigger_group(observation)
         if bigger is not None:
@@ -640,6 +730,13 @@ class Agent:
             target = self._select_target(observation, paths, adjacent)
             stay = next(option for option in paths if option[0] == 0)
             return self._attack_or_flee(observation, paths, [stay], target, enemies)
+
+        if HOME_ZONE_HOLDER and self._home_holder and self._home_zone is not None:
+            # S5 task 5: the holder walks to our home zone and stays there (adjacent enemies are
+            # struck above). None = it would die on the zone, so the usual rules take over.
+            hold = self._hold_home(observation, paths)
+            if hold is not None:
+                return self._order(hold, None, observation)
 
         here = me.position(observation)
         uphill = [
@@ -742,6 +839,17 @@ class Agent:
                 duty = self._zone_duty(observation, paths, allies)
                 if duty is not None:
                     return duty
+
+        # S5 task 5: the fight has gone quiet while the enemy keeps scoring: go to its home zone
+        # (above the formation, which would otherwise hold the wall slot with nothing to fight).
+        hunt_goal = self._hunt_goal(enemies) if HUNT_ENEMY_ZONE else None
+        if hunt_goal is not None:
+            return self._toward(observation, paths, hunt_goal)
+        if ZONE_SQUADS and self._squad_zone is not None:
+            # S5 task 5, design (a): squad members go to and hold their squad's zone.
+            squad = self._squad_move(observation, paths, self._squad_zone)
+            if squad is not None:
+                return squad
 
         group = self._protect_goal(observation, allies)
         front = self._front_point(observation)
@@ -998,6 +1106,70 @@ class Agent:
                 best, best_key = path_id, key
         return action.move(best) if best else action.stay()
 
+    def _hold_home(self, observation: SkirmishObservation, paths: list[PathOption]) -> int | None:
+        """S5 task 5: the home-zone holder's move. None = let the usual rules decide.
+
+        On a home-zone tile it stays while it survives the expected damage there. Otherwise it walks
+        to the nearest free, passable home-zone tile (ties side-neutral, see _tie_spot).
+        """
+        here = self._here
+        here_key = self._key(here)
+        tiles = self._home_zone["tiles"]
+        if here_key in tiles:
+            return 0 if self._incoming(observation, here) < me.hit_points(observation) else None
+        spots = [
+            spot
+            for spot in tiles
+            if spot not in self._marsh and spot not in self._blocked and self._cost_grid.get(spot) is not None
+        ]
+        if not spots:
+            return None
+        goal = min(spots, key=lambda spot: (self._key_distance(spot, here_key), self._tie_spot(spot)))
+        return self._toward(observation, paths, {"q": goal[0], "r": goal[1]})
+
+    def _squad_move(self, observation: SkirmishObservation, paths: list[PathOption], area: dict) -> int | None:
+        """S5 task 5, design (a): a squad member's idle move toward / on its squad zone.
+
+        Footmen hold a zone tile like the home holder (_hold_home's rule, for any zone); archers and
+        cavalry stay within SQUAD_RADIUS of the zone's centre. None = let the usual rules decide.
+        """
+        here = self._here
+        if me.unit_type(observation) == "footman":
+            here_key = self._key(here)
+            if here_key in area["tiles"]:
+                return 0 if self._incoming(observation, here) < me.hit_points(observation) else None
+            spots = [
+                spot
+                for spot in area["tiles"]
+                if spot not in self._marsh and spot not in self._blocked and self._cost_grid.get(spot) is not None
+            ]
+            if not spots:
+                return None
+            goal = min(spots, key=lambda spot: (self._key_distance(spot, here_key), self._tie_spot(spot)))
+            return self._toward(observation, paths, {"q": goal[0], "r": goal[1]})
+        if self._distance(here, area["center"]) <= SQUAD_RADIUS:
+            return 0
+        return self._toward(observation, paths, area["center"])
+
+    def _hunt_goal(self, enemies: list[VisibleUnit]) -> Position | None:
+        """S5 task 5: the enemy home zone's center while the fight is quiet and the enemy scores.
+
+        Quiet = no enemy in sight and none remembered from the last HUNT_QUIET_ROUNDS rounds; scoring
+        = the enemy's capture score rose within HUNT_SCORE_ROUNDS. Once we see that zone with no
+        enemy on it, the hunt stops there and the usual rules (memory, wandering) take over.
+        """
+        if self._enemy_home_zone is None or enemies or self._enemy_scored_round is None:
+            return None
+        if self._round - self._enemy_scored_round > HUNT_SCORE_ROUNDS:
+            return None
+        if self._recent(self._enemy_memory, HUNT_QUIET_ROUNDS):
+            return None
+        index = self._zone_areas.index(self._enemy_home_zone)
+        picture = self._zone["zones"][index]
+        if picture["sees"] and picture["theirs"] == 0:
+            return None
+        return self._enemy_home_zone["center"]
+
     def _zone_duty(
         self, observation: SkirmishObservation, paths: list[PathOption], allies: list[VisibleUnit], forced: bool = False
     ) -> int | None:
@@ -1013,6 +1185,10 @@ class Agent:
         forced (S4 task 12): the forecast judge's "zone" candidate. It skips the "is it needed" and
         "am I among the nearest" checks and accepts any tile we survive; the forecast weighs the
         risk. Still None when ZONE_KEEPERS footmen already keep the zone or it is out of reach.
+
+        S5 task 4: with several zones, ZONE_KEEPERS counts per zone. A footman on a zone tile judges
+        that zone; otherwise it picks the nearest zone that needs us (any zone when urgent or forced,
+        skipping zones already kept by ZONE_KEEPERS when forced), ties by zone index.
         """
         status = self._zone
         if not status:
@@ -1020,22 +1196,29 @@ class Agent:
         here = self._here
         here_key = self._key(here)
         hit_points = me.hit_points(observation)
-        footmen_on = [
-            ally for ally in allies if ally["type"] == "footman" and self._key(ally["position"]) in self._zone_tiles
-        ]
+
+        def footmen_on(area: dict) -> list[VisibleUnit]:
+            return [ally for ally in allies if ally["type"] == "footman" and self._key(ally["position"]) in area["tiles"]]
+
         urgent = status["urgent"]
-        if here_key in self._zone_tiles:
-            if (urgent or len(footmen_on) < ZONE_KEEPERS) and self._incoming(observation, here) < hit_points:
+        current = next((area for area in status["zones"] if here_key in area["tiles"]), None)
+        if current is not None:
+            if (urgent or len(footmen_on(current)) < ZONE_KEEPERS) and self._incoming(observation, here) < hit_points:
                 return 0
             return None
-        if forced and not urgent and len(footmen_on) >= ZONE_KEEPERS:
+        candidates = [
+            area
+            for area in status["zones"]
+            if (urgent or forced or area["enemy_scoring"] or area["ours"] == 0)
+            and not (forced and not urgent and len(footmen_on(area)) >= ZONE_KEEPERS)
+        ]
+        if not candidates:
             return None
-        needed = status["enemy_scoring"] or status["ours"] == 0
-        if not needed and not urgent and not forced:
-            return None
+        chosen = min(candidates, key=lambda area: (self._distance(here, area["center"]), area["index"]))
+        on_chosen = footmen_on(chosen)
         if not urgent and not forced:
             # Only the ZONE_KEEPERS footmen nearest the zone go (ties by roster index, side-neutral).
-            center = self._zone_centers[0]
+            center = chosen["center"]
 
             def rank(unit_id: str, position: AxialPosition) -> tuple:
                 return (self._distance(position, center), int(unit_id.split("_")[2]))
@@ -1046,12 +1229,12 @@ class Agent:
                 for ally in allies
                 if ally["type"] == "footman" and self._key(ally["position"]) not in self._zone_tiles
             )
-            if closer + len(footmen_on) >= ZONE_KEEPERS:
+            if closer + len(on_chosen) >= ZONE_KEEPERS:
                 return None
-        survivable = status["enemy_scoring"] or urgent or forced
+        survivable = chosen["enemy_scoring"] or urgent or forced
         spots = [
             spot
-            for spot in self._zone_tiles
+            for spot in chosen["tiles"]
             if spot not in self._marsh and spot not in self._blocked and self._cost_grid.get(spot) is not None
         ]
         if not spots:
@@ -1059,7 +1242,7 @@ class Agent:
         turns = self._route_turns(observation, [{"q": q, "r": r} for q, r in spots])
         if turns.get(here_key, UNREACHABLE) > ZONE_DUTY_TURNS:
             return None
-        keepers = {self._key(ally["position"]) for ally in footmen_on}
+        keepers = {self._key(ally["position"]) for ally in on_chosen}
 
         def acceptable(spot: Key) -> bool:
             damage = self._incoming(observation, {"q": spot[0], "r": spot[1]})

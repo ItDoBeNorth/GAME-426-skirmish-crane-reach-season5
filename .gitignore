@@ -10,3 +10,6 @@ __pycache__/
 
 # Collected demonstrations, training reports, and evaluations from the imitation experiment.
 runs/
+
+# Rival agents for local benchmarks (Banner from git, frozen copies of our agents).
+rivals/
