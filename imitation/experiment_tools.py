@@ -5,6 +5,7 @@ To match how the template runs a submission, each unit gets its own teacher with
 state. RecordingPlayer then records what happens at each activation.
 """
 
+import sys
 from collections.abc import Mapping
 from copy import deepcopy
 from importlib import import_module
@@ -14,10 +15,11 @@ from statistics import mean
 from time import perf_counter
 
 import numpy as np
+from enemy_memory import EnemyMemory
 from sandbox.env import META, default_action, extract_overlay, extract_overlay_static, make_env
 from sandbox.env.skirmish_crane.naive import Agent as Naive
 from sandbox.harness.environment import EnvironmentEntry, resolve_layout, resolve_parameters
-from sandbox.harness.manifest import _evict_modules_from_roots
+from sandbox.harness.manifest import _evict_modules_from_roots, load_agent
 from sandbox.harness.session import REASON_TERMINATED, REASON_TRUNCATED, AgentPlayer, run_episode
 from sandbox.season import load_season_settings
 
@@ -69,6 +71,34 @@ def load_teacher(spec):
     return lambda: load_class()()
 
 
+def load_opponent(spec, teacher_factory):
+    """S5 task 7: who plays the other seat. "naive" (the template's default), "teacher" (self-play:
+    a fresh teacher per unit, never recorded), or a folder holding an agent's manifest.json, such
+    as rivals/banner. Returns a factory that builds one opponent agent per unit.
+    """
+    if spec == "naive":
+        return Naive
+    if spec == "teacher":
+        return teacher_factory
+    folder = Path(spec).resolve()
+    if not (folder / "manifest.json").exists():
+        raise ValueError(f"--opponent {spec!r} is not naive, teacher, or a folder with manifest.json")
+
+    def make():
+        # load_agent puts the folder first on sys.path and imports its entry point (usually "agent").
+        # Restore the path and drop the folder's modules afterwards, so the learner's own agent.py,
+        # encoder.py and teacher.py keep resolving to this project. The built agent keeps its modules.
+        saved_path = list(sys.path)
+        try:
+            return load_agent(folder)
+        finally:
+            sys.path[:] = saved_path
+            _evict_modules_from_roots((folder,))
+
+    make()  # Check that the opponent loads before starting any episodes.
+    return make
+
+
 class RecordingPlayer:
     """Give one unit its own agent and record the teacher's choice at each activation.
 
@@ -82,8 +112,12 @@ class RecordingPlayer:
         self.agent, self.seed, self.seat = agent, seed, seat
         self.rows, self.timings, self.labeler, self.record = rows, timings, labeler, record
         self.first_act_ms = None
+        # S5 task 9: the acting unit's memory of enemies out of sight, the same tracker the learner
+        # keeps in play, updated from this unit's own observations before each record.
+        self.memory = EnemyMemory()
 
     def reset(self, seed, observation):
+        self.memory = EnemyMemory()
         if self.labeler is not None:
             self.labeler.reset(seed, deepcopy(observation))
         self.agent.reset(seed, observation)
@@ -91,10 +125,23 @@ class RecordingPlayer:
     def __getattr__(self, name):
         return getattr(self.agent, name)
 
+    def chat(self, inbox):
+        """S5 task 11: in learner-driven collection the labeler (a teacher) does the talking.
+
+        The teacher reads chat reports from its allies (enemy sightings, help alerts, group
+        positions), and its labels depend on them. The learner has no chat, so we pass each inbox
+        to the labeler and send what it answers, letting the labelers talk to one another as they
+        would in a teacher game. In teacher-driven collection the playing teacher chats as before.
+        """
+        speaker = self.labeler if self.labeler is not None else self.agent
+        handler = getattr(speaker, "chat", None)
+        return handler(inbox) if callable(handler) else None
+
     def act(self, observation):
         if self.rows is not None:
             # Copy the situation before either agent has a chance to modify the observation.
             before = deepcopy(observation)
+            self.memory.update(before)
             label = None if self.labeler is None else self.labeler.act(deepcopy(observation))
 
         start = perf_counter()
@@ -110,13 +157,16 @@ class RecordingPlayer:
                 "seat": self.seat,
                 "driver": "teacher" if self.labeler is None else "learner",
             }
-            row.update(self.record(before, action if self.labeler is None else label))
+            row.update(self.record(before, action if self.labeler is None else label, memory=self.memory))
             self.rows.append(row)
         return action
 
 
-def episode(kind, seed, seat, teacher_factory, rows=None, record=None):
-    """Play one episode with kind in seat against Naive. If rows is given, record teacher choices."""
+def episode(kind, seed, seat, teacher_factory, rows=None, record=None, opponent_factory=Naive):
+    """Play one episode with kind in seat against Naive. If rows is given, record teacher choices.
+
+    S5 task 7: opponent_factory (see load_opponent) replaces Naive in the other seat.
+    """
     season = load_season_settings(ROOT, META)
     parameters = resolve_parameters(META, {} if season is None else season.parameters)
     layout = resolve_layout(META, parameters)
@@ -138,7 +188,7 @@ def episode(kind, seed, seat, teacher_factory, rows=None, record=None):
         )
         for player in own
     }
-    players = {player: recorders[player] if player in recorders else Naive() for player in layout.players}
+    players = {player: recorders[player] if player in recorders else opponent_factory() for player in layout.players}
     # The season's time limits, or the environment's own where season.json sets none.
     step_limit = season.decision_limit_ms if season and season.decision_limit_ms else META.step_limit_ms
     game_limit = season.game_limit_ms if season and season.game_limit_ms else META.episode_limit_ms

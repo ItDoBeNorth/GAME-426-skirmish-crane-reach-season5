@@ -20,10 +20,10 @@ from statistics import mean
 import encoder
 from sandbox.crane import tile
 
-from imitation.experiment_tools import ROOT, RUNS, action_labels, episode, load_teacher
+from imitation.experiment_tools import ROOT, RUNS, action_labels, episode, load_opponent, load_teacher
 
 
-def demonstration(observation, action):
+def demonstration(observation, action, memory=None):
     """Record one demonstration, describing each legal option and labeling the teacher's choices.
 
     A record holds the inputs and the labels for one unit's activation:
@@ -35,7 +35,10 @@ def demonstration(observation, action):
       teacher's tile, and target_choice marks the teacher's target.
     - To help you inspect disagreements later, paths and targets keep the IDs behind the option
       rows, while path and target keep the teacher's action.
+    - S5 task 9: memory is the acting unit's enemy_memory.EnemyMemory, already updated with this
+      observation by RecordingPlayer; its remembered enemies enter the rows as they do in play.
     """
+    remembered = memory.remembered(observation) if memory is not None else ()
     # To label the teacher's chosen tile and target, we first check that its action is legal.
     path, target = action_labels(observation, action)
 
@@ -47,7 +50,7 @@ def demonstration(observation, action):
 
     # For the inputs, we describe every option with the same encoder the learner uses in play.
     targets = encoder.target_options(observation)
-    entities, enemy_indices = encoder.encode_entities(observation)
+    entities, enemy_indices = encoder.encode_entities(observation, remembered)
     return {
         "unit": unit["unit_id"],
         "unit_type": unit["type"],
@@ -57,7 +60,7 @@ def demonstration(observation, action):
         "entities": entities,
         "target_entity_indices": encoder.target_entity_indices(observation, targets, enemy_indices),
         "paths": [path_id for path_id, _ in moves],
-        "move_options": [encoder.describe_move(observation, end) for end in ends],
+        "move_options": [encoder.describe_move(observation, end, path_id, remembered) for path_id, end in moves],
         "move_choice": ends.index(chosen_end),
         # We describe targets from the teacher's tile, where it chose its target.
         "targets": targets,
@@ -84,6 +87,11 @@ def main():
         default="teacher",
         help="collection only: who plays while the teacher labels; learner needs imitation-policy.pt",
     )
+    parser.add_argument(
+        "--opponent",
+        default="naive",
+        help="S5 task 7: who plays the other seat: naive, teacher (self-play), or an agent folder such as rivals/banner",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.episodes < 1:
@@ -92,6 +100,7 @@ def main():
         args.start = 0 if args.command == "collect" else 1000
     try:
         teacher_factory = load_teacher(args.teacher)
+        opponent_factory = load_opponent(args.opponent, teacher_factory)
     except (ImportError, AttributeError, ValueError) as exc:
         parser.error(str(exc))
     if args.command == "collect" and args.driver == "learner" and not (ROOT / "imitation-policy.pt").exists():
@@ -110,10 +119,16 @@ def main():
         for seat in (0, 1):
             for kind in kinds:
                 if args.command == "collect":
-                    result = episode(kind, seed, seat, teacher_factory, rows, record=demonstration)
+                    start = len(rows)
+                    result = episode(
+                        kind, seed, seat, teacher_factory, rows, record=demonstration, opponent_factory=opponent_factory
+                    )
+                    for row in rows[start:]:
+                        row["opponent"] = args.opponent
                 else:
-                    result = episode(kind, seed, seat, teacher_factory)
+                    result = episode(kind, seed, seat, teacher_factory, opponent_factory=opponent_factory)
                 result["teacher"] = args.teacher
+                result["opponent"] = args.opponent
                 results.append(result)
                 print(json.dumps(result), flush=True)
 

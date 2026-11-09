@@ -116,6 +116,25 @@ ZONE_SQUADS = False
 SQUAD_HOME = {"footman": (0, 1), "archer": (0,), "cavalry": ()}
 SQUAD_FLANK = {"footman": (2, 3), "archer": (1,), "cavalry": (0, 1, 2)}
 SQUAD_RADIUS = 2
+# S5 fix 1 (S4 playtest: "archers don't make use of the environment"): only ~8% of our arrows came
+# from a hill (+1 damage onto lower ground). Among safe firing tiles, archers now rank arrow damage
+# first, then terrain, then distance from the target (was distance first).
+ARCHER_HIGH_GROUND = True
+# S5 fix 2 (S4 playtest: "cavalry are a little too aggressive and don't bring a lot of value"): our
+# cavalry lived ~4 activations, taking 2.6 damage per activation while dealing 1.8. Two parts:
+# CAVALRY_PROTECT_ARCHERS_ONLY: cavalry break off to protect only allied archers (was any ally type).
+# CAVALRY_NO_LETHAL_ATTACK: never take a non-killing attack whose tile would kill us when any tile
+# is less dangerous.
+# Both together (with ARCHER_HIGH_GROUND), seeds 600-619 wins/40 (mean): Banner 40 (95.0), previous
+# teacher 17 (42.5), Banner learner 37 (93.5), t8b learner 17 (43.5); without them: 40 (95.8), 25
+# (61.8), 36 (91.8), 17 (43.3). Cavalry lived longer (5.8 vs 4.3 activations) but dealt ~0.9
+# damage per activation instead of 1.6: too passive.
+# Each part alone (with ARCHER_HIGH_GROUND): CAVALRY_PROTECT_ARCHERS_ONLY gives exactly the "both"
+# games (the whole loss); CAVALRY_NO_LETHAL_ATTACK never fires (games identical to without it).
+# So cavalry diving in to protect footmen pays off even though it shortens their lives. All off.
+CAVALRY_CAUTION = False
+CAVALRY_PROTECT_ARCHERS_ONLY = False
+CAVALRY_NO_LETHAL_ATTACK = False
 # Forecast judge (S4 task 12, the course's search-based planning): a footman compares candidate
 # moves (hold its slot, advance on a target, and go to the zone if FORECAST_ZONE_CANDIDATE) by
 # forecasting FORECAST_ROUNDS of its own activations and scoring
@@ -646,6 +665,19 @@ class Agent:
         if safe_firing:
             # A firing tile that no enemy can reach this round exists: kite while
             # preserving the shot, preferring the option farthest from the target.
+            if ARCHER_HIGH_GROUND:
+                # S5 fix 1: every safe tile is equally safe this round, so take the one whose arrow
+                # hurts most (a hill onto lower ground is +1), then the better ground, then distance.
+                path = max(
+                    safe_firing,
+                    key=lambda option: (
+                        self._expected_damage(observation, "archer", option[1], target),
+                        self._terrain_preference(observation, option[1]),
+                        self._distance(option[1], target["position"]),
+                        -self._tie(option[0]),
+                    ),
+                )
+                return self._order(path[0], target["unit_id"], observation)
             path = max(
                 safe_firing,
                 key=lambda option: (
@@ -1420,7 +1452,9 @@ class Agent:
         """
         best = self._best_attack_path(observation, attack_paths, target)
         attack = self._order(best[0], target["unit_id"], observation)
-        if self._can_kill_this_turn(observation, paths, target) or self._protecting(target, TYPE_RANK):
+        # S5 fix 2 (CAVALRY_CAUTION): protect only allied archers, like footmen do (was any ally type).
+        protected = {"archer"} if CAVALRY_CAUTION or CAVALRY_PROTECT_ARCHERS_ONLY else TYPE_RANK
+        if self._can_kill_this_turn(observation, paths, target) or self._protecting(target, protected):
             return attack
         if FORECAST_CAVALRY:
             # S4 task 12b: past the sure cases, a forecast picks attack / set up a charge / flee.
@@ -1458,6 +1492,19 @@ class Agent:
         flee_end = next(end for path_id, end in paths if path_id == flee_path)
         if self._incoming(observation, flee_end) < incoming:
             return self._order(flee_path, None, observation)
+        if (CAVALRY_CAUTION or CAVALRY_NO_LETHAL_ATTACK) and incoming >= me.hit_points(observation):
+            # S5 fix 2: nothing is safer than the attack tile, but the attack (no kill) would get us
+            # killed: take the least-dangerous tile anywhere instead of trading our 10 HP for 3-5.
+            safest = min(
+                paths,
+                key=lambda option: (
+                    self._incoming(observation, option[1]),
+                    -self._terrain_preference(observation, option[1]),
+                    self._tie(option[0]),
+                ),
+            )
+            if self._incoming(observation, safest[1]) < incoming:
+                return self._order(safest[0], None, observation)
         return attack
 
     def _judge_cavalry(

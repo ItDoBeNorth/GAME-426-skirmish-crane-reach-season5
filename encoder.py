@@ -20,9 +20,23 @@ encode_entities describes the acting unit, visible units, and capture zones as t
 one row per entity. Target pointers let the model read the named enemy's token directly.
 """
 
-from sandbox.crane import me, roster, tile, units, visible, zone
+from routes import NO_ROUTE, route_cost
+from sandbox.crane import me, paths, roster, tile, units, visible, zone
 
-VERSION = "entity-attention-v2"
+# S5 task 8a: "s5-features-a" adds what our teacher (the S4/S5 rule agent) reads that v2 left out:
+# shield-wall partners, charge walk length, distances to archers, home zones, and the holder flag.
+# S5 task 8b: "s5-features-b" adds terrain-aware routes (the lesson's route_cost) and the river
+# crossings, since the teacher routes by movement cost and walls the ford.
+# S5 task 9: "s5-memory" adds remembered enemies (enemy_memory.EnemyMemory) as their own tokens and
+# as tile distances, for the idle moves the teacher makes from memory.
+# Off: it lost to s5-features-b on seeds 600-619 (wins/40, mean): Banner 40 (94.5) vs 40 (96.7),
+# teacher 20 (47.9) vs 26 (63.3), Banner learner 39 (92.1) vs 38 (90.6), and head-to-head vs the
+# s5-features-b learner 17/40 (41.7). Agreement did not rise (48.5% vs 50.0%; idle archers 30% vs
+# 33%): the teacher's idle moves come from chat reports and its formation, not only its own sight.
+# Turning it on changes VERSION and the feature lists, so collect and retrain (tools/feature_round.sh).
+USE_MEMORY_FEATURES = False
+VERSION = "s5-memory" if USE_MEMORY_FEATURES else "s5-features-b"
+MEMORY_AGE_SCALE = 20  # divides a remembered enemy's age (enemy_memory.MAX_AGE)
 KINDS = ("footman", "archer", "cavalry")
 TERRAINS = ("grass", "hill", "water", "void")
 GROUND_FEATURES = ("none", "forest", "marsh", "waste")
@@ -56,6 +70,20 @@ MOVE_FEATURES = (
     # The oriented destination
     "end_q",
     "end_r",
+    # S5 task 8a: what the teacher reads that v2 left out.
+    "first_footman",  # the acting unit is our first footman, the teacher's home-zone holder
+    "adjacent_footmen",  # allied footmen next to the tile: a footman there gets the shield wall
+    "walk_length",  # steps of the kept path; cavalry ending a walk of 3+ steps charges
+    "charge_ready",  # cavalry and walk_length >= 3
+    "nearest_ally_archer",  # the footman wall forms around our nearest archer
+    "nearest_enemy_archer",  # cavalry hunt enemy archers, our archers duel them
+    "home_zone_distance",  # our outer zone, behind us (the holder's post)
+    "enemy_home_zone_distance",  # the enemy's outer zone (the hunt goal)
+    # S5 task 8b: terrain-aware routes and the river crossings.
+    "route_to_nearest_enemy",  # cheapest movement cost from the tile to a visible enemy (water blocks)
+    "crossing_distance",  # steps from the tile to the nearest passable tile of the river column
+    # S5 task 9: enemies this unit remembers but cannot see now (only with USE_MEMORY_FEATURES).
+    *(("remembered_enemies", "nearest_remembered_enemy") if USE_MEMORY_FEATURES else ()),
 )
 TARGET_FEATURES = (
     "no_target",
@@ -89,6 +117,11 @@ ENTITY_FEATURES = (
     "own_score",
     "opponent_score",
     "score_difference",
+    # S5 task 8b (the lesson's practice 2): the movement cost from the acting unit to this enemy.
+    "route_cost",
+    # S5 task 9: a remembered enemy's token (its own kind, like self/ally/enemy/zone) and its age
+    # (only with USE_MEMORY_FEATURES).
+    *(("remembered", "age") if USE_MEMORY_FEATURES else ()),
 )
 
 
@@ -103,8 +136,13 @@ def oriented_offset(observation, start, end):
     return ((end["q"] - start["q"]) * scale, (end["r"] - start["r"]) * scale)
 
 
-def encode_entities(observation):
-    """Return entity rows and a map from visible enemy IDs to their row indices."""
+def encode_entities(observation, remembered=()):
+    """Return entity rows and a map from visible enemy IDs to their row indices.
+
+    S5 task 9: remembered is enemy_memory.EnemyMemory.remembered(observation): enemies seen before
+    but out of sight now. Each gets a "remembered" token after the visible units; targets never
+    point at them (only visible enemies can be named).
+    """
     own = observation["observation"]["self"]
     side = me.side(observation)
     rows, enemies = [], {}
@@ -137,8 +175,23 @@ def encode_entities(observation):
                 values["score_difference"] = (capture[side] - capture[opponent]) / capture["target"]
         if kind == "enemy":
             # In the practice, you can add a route cost to this token with route_cost from routes.py.
+            # S5 task 8b: done. Divided by NO_ROUTE to keep the number small.
+            values["route_cost"] = route_cost(observation, own["position"], unit["position"]) / NO_ROUTE
             # IDs connect targets to rows, but never become numeric model features.
             enemies[unit["unit_id"]] = len(rows)
+        rows.append(as_row(values, ENTITY_FEATURES))
+    for record in remembered if USE_MEMORY_FEATURES else ():
+        # S5 task 9: where the enemy was last seen, what it was, and how long ago.
+        values = token("remembered", record["position"])
+        stats = units.STATS[record["type"]]
+        values.update(one_hot(record["type"], KINDS))
+        values.update(
+            health_fraction=record["hit_points"] / stats.hit_points,
+            movement=stats.movement_points / 4,
+            attack_range=stats.attack_range / 3,
+            route_cost=route_cost(observation, own["position"], record["position"]) / NO_ROUTE,
+            age=record["age"] / MEMORY_AGE_SCALE,
+        )
         rows.append(as_row(values, ENTITY_FEATURES))
     grid_width = observation["observation"]["battlefield"]["side"]
     for area in zone.zones(observation):
@@ -195,8 +248,54 @@ def target_options(observation):
 # --- The rows: how one option becomes numbers -------------------------------------------------
 
 
-def describe_move(observation, end):
-    """Describe ending this activation on the tile end, with one value per name in MOVE_FEATURES."""
+def home_zones(observation):
+    """S5 task 8a: (our home zone center, the enemy's home zone center), or (None, None).
+
+    Home zones are the outer zones (not the field's middle). Ours lies furthest behind us along
+    our forward direction, the enemy's furthest ahead, so both sides read the same way.
+    """
+    middle = tile.at_center(observation)
+    outer = [area["center"] for area in zone.zones(observation) if area["center"] != middle]
+    if len(outer) < 2:
+        return None, None
+    step_q, step_r = tile.DIRECTIONS[me.direction(observation)]
+
+    def ahead(center):
+        return (center["q"] - middle["q"]) * step_q + (center["r"] - middle["r"]) * step_r
+
+    ordered = sorted(outer, key=ahead)
+    return ordered[0], ordered[-1]
+
+
+def crossings(observation):
+    """S5 task 8b: the passable tiles of the river column (the middle column of the square grid).
+
+    The river runs down that column with passages through it; with capture zones the middle
+    passage holds the middle zone. Computed once per observation (describe_move runs per tile).
+    """
+    cached = _crossings.get("observation")
+    if cached is not observation:
+        grid = observation["observation"]["battlefield"]["tiles"]
+        column = observation["observation"]["battlefield"]["side"] // 2
+        _crossings["observation"] = observation
+        _crossings["tiles"] = [
+            {"q": column, "r": r}
+            for r in range(len(grid))
+            if grid[r][column]["terrain"] not in ("water", "void")
+        ]
+    return _crossings["tiles"]
+
+
+_crossings: dict = {"observation": None, "tiles": []}
+
+
+def describe_move(observation, end, path_id=None, remembered=()):
+    """Describe ending this activation on the tile end, with one value per name in MOVE_FEATURES.
+
+    S5 task 8a: path_id is the kept path to end (see move_options), for the walk length. Without
+    it the walk length falls back to the straight-line distance.
+    S5 task 9: remembered is the same list encode_entities receives.
+    """
     # We use the current observation to describe the candidate tile end.
     own = observation["observation"]["self"]
     here = own["position"]
@@ -214,6 +313,11 @@ def describe_move(observation, end):
     ground = tile.terrain_at(observation, end)
     # The destination itself, as a step offset turned to face the enemy side.
     end_q, end_r = oriented_offset(observation, here, end)
+    # S5 task 8a inputs.
+    allies = visible.allies(observation)
+    walk = len(paths.decode(path_id)) if path_id is not None else tile.distance(here, end)
+    home, enemy_home = home_zones(observation)
+    first_footman = next((entry["unit_id"] for entry in roster.allies(observation) if entry["type"] == "footman"), None)
 
     features = {
         # Acting unit: these values are the same for every tile in one decision.
@@ -252,7 +356,34 @@ def describe_move(observation, end):
         **one_hot(ground["feature"], GROUND_FEATURES),
         "end_q": end_q,
         "end_r": end_r,
+        # S5 task 8a: shield wall, charge, archers, home zones and the holder flag.
+        "first_footman": int(own["unit_id"] == first_footman),
+        "adjacent_footmen": sum(
+            ally["type"] == "footman" and tile.distance(end, ally["position"]) == 1 for ally in allies
+        ),
+        "walk_length": walk,
+        "charge_ready": int(own["type"] == "cavalry" and walk >= 3),
+        "nearest_ally_archer": min(
+            (tile.distance(end, ally["position"]) for ally in allies if ally["type"] == "archer"), default=FAR
+        ),
+        "nearest_enemy_archer": min(
+            (tile.distance(end, enemy["position"]) for enemy in enemies if enemy["type"] == "archer"), default=FAR
+        ),
+        "home_zone_distance": FAR if home is None else tile.distance(end, home),
+        "enemy_home_zone_distance": FAR if enemy_home is None else tile.distance(end, enemy_home),
+        # S5 task 8b: route_cost searches backward from each enemy once per observation (cached).
+        "route_to_nearest_enemy": min(
+            (route_cost(observation, end, enemy["position"]) for enemy in enemies), default=NO_ROUTE
+        )
+        / NO_ROUTE,
+        "crossing_distance": min((tile.distance(end, spot) for spot in crossings(observation)), default=FAR),
     }
+    if USE_MEMORY_FEATURES:
+        # S5 task 9: remembered enemies, out of sight now.
+        features["remembered_enemies"] = len(remembered)
+        features["nearest_remembered_enemy"] = min(
+            (tile.distance(end, record["position"]) for record in remembered), default=FAR
+        )
     return as_row(features, MOVE_FEATURES)
 
 
